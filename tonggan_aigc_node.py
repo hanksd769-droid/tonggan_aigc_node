@@ -1,8 +1,9 @@
 """
-ComfyUI 自定义节点：通感 AIGC 生图 API（修复版）
+ComfyUI 自定义节点：通感 AIGC 生图 API + 图片上传
 
-功能：提交生图任务 → 自动轮询状态 → 输出图片 URL 列表（JSON 字符串）
-关键修复：显式传入 modelName/modelVersion，与 Coze 调用保持一致。
+功能：
+1. TongganAIGCNode: 提交生图任务 → 自动轮询状态 → 输出图片 URL 列表（纯文本）
+2. TongganImageUploadNode: 本地图片 → 上传七牛云 → 输出图片 URL
 
 安装：将本文件保存到 ComfyUI/custom_nodes/tonggan_aigc_node.py，重启 ComfyUI
 """
@@ -10,8 +11,12 @@ ComfyUI 自定义节点：通感 AIGC 生图 API（修复版）
 import time
 import json
 import requests
+import io
+import numpy as np
+from PIL import Image
 
 
+# ==================== 节点一：生图 ====================
 class TongganAIGCNode:
     """
     调用通感 AIGC 生图 API。
@@ -23,13 +28,6 @@ class TongganAIGCNode:
     RETURN_NAMES = ("image_urls",)
     FUNCTION = "generate"
     OUTPUT_NODE = True
-
-    STATUS_MAP = {
-        "WAITING": "排队中",
-        "PROCESSING": "处理中",
-        "FINISH": "已完成",
-        "FAIL": "失败",
-    }
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -49,7 +47,7 @@ class TongganAIGCNode:
                 "inputFiles": ("STRING", {
                     "multiline": True,
                     "default": "",
-                    "placeholder": "参考图片 URL，多个用英文逗号分隔；不填则传空数组 []",
+                    "placeholder": "参考图片 URL，多个用英文逗号分隔；不填则传空数组",
                 }),
                 "app_id": ("STRING", {
                     "default": "",
@@ -92,40 +90,28 @@ class TongganAIGCNode:
         poll_interval,
         max_attempts,
     ):
-        print("\n" + "=" * 60)
-        print("[Tonggan AIGC] 🚀 开始执行")
-        print("=" * 60)
-
-        # ---------- 1. 构建请求体 ----------
+        # 构建请求体
         task_id = int(time.time() * 1000) % 1000000
         body = {
             "taskId": task_id,
             "prompt": prompt,
             "resolution": resolution,
-            "modelName": "GG",        # 关键：显式传入，与 Coze 保持一致
-            "modelVersion": "3.1",    # 关键：显式传入，与 Coze 保持一致
+            "modelName": "GG",
+            "modelVersion": "3.1",
         }
 
-        # aspectRatio 处理
         if aspectRatio == "auto":
             body["aspectRatio"] = ""
         else:
             body["aspectRatio"] = aspectRatio
 
-        # inputFiles 处理：不填图片时传 []，填了则转 [{"url": "xxx"}, ...]
         if inputFiles and inputFiles.strip():
             urls = [u.strip() for u in inputFiles.split(",") if u.strip()]
-            if urls:
-                body["inputFiles"] = [{"url": url} for url in urls]
-                print(f"[Tonggan AIGC] 📎 传入参考图片，共 {len(urls)} 张")
-            else:
-                body["inputFiles"] = []
-                print("[Tonggan AIGC] 📎 inputFiles 为空，传 []")
+            body["inputFiles"] = [{"url": url} for url in urls]
         else:
             body["inputFiles"] = []
-            print("[Tonggan AIGC] 📎 inputFiles 未填写，传 []（文生图模式）")
 
-        # ---------- 2. 构建 URL ----------
+        # 构建 URL
         base = base_url.strip().rstrip("/")
         for suffix in ("/tencent-aigc-image/status", "/tencent-aigc-image"):
             if base.endswith(suffix):
@@ -141,37 +127,16 @@ class TongganAIGCNode:
             "Content-Type": "application/json",
         }
 
-        # 打印完整请求信息
-        print("\n" + "-" * 60)
-        print("[Tonggan AIGC] 📤 提交任务信息：")
-        print(f"  URL: {submit_url}")
-        print(f"  Headers: {json.dumps(headers, ensure_ascii=False, indent=2)}")
-        print(f"  Body: {json.dumps(body, ensure_ascii=False, indent=2)}")
-        print("-" * 60 + "\n")
-
-        # ---------- 3. 提交任务 ----------
-        try:
-            resp = requests.post(
-                submit_url,
-                json=body,
-                headers=headers,
-                timeout=30,
-                allow_redirects=False,
-            )
-            print(f"[Tonggan AIGC] 📥 响应状态码: {resp.status_code}")
-            print(f"[Tonggan AIGC] 📥 响应内容: {resp.text[:500]}")
-
-            if resp.status_code in (301, 302, 307, 308):
-                loc = resp.headers.get("Location", "未知")
-                raise RuntimeError(
-                    f"服务器返回 {resp.status_code} 重定向到 {loc}，"
-                    f"请将 base_url 改为 HTTPS 地址。"
-                )
-            resp.raise_for_status()
-            result = resp.json()
-        except Exception as e:
-            print(f"[Tonggan AIGC] ❌ 提交任务异常: {e}")
-            raise RuntimeError(f"[Tonggan AIGC] 提交任务网络异常: {e}")
+        # 提交任务
+        resp = requests.post(
+            submit_url,
+            json=body,
+            headers=headers,
+            timeout=30,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        result = resp.json()
 
         if result.get("code") != 200:
             raise RuntimeError(
@@ -179,65 +144,42 @@ class TongganAIGCNode:
             )
 
         tencent_task_id = result["data"]["tencentTaskId"]
-        print(f"[Tonggan AIGC] ✅ 提交成功，腾讯云任务ID: {tencent_task_id}")
 
-        # ---------- 4. 轮询查询状态 ----------
+        # 轮询查询状态
         image_urls = []
-        last_status = None
 
-        print(f"[Tonggan AIGC] ⏳ 开始轮询，最多 {max_attempts} 次，间隔 {poll_interval} 秒")
-
-        for attempt in range(max_attempts):
+        for _ in range(max_attempts):
             time.sleep(poll_interval)
 
-            try:
-                resp = requests.get(
-                    status_url,
-                    params={"taskId": tencent_task_id},
-                    headers={"X-App-Id": app_id.strip(), "X-Api-Key": api_key.strip()},
-                    timeout=30,
-                    allow_redirects=False,
-                )
-                resp.raise_for_status()
-                status_result = resp.json()
-            except Exception as e:
-                print(f"[Tonggan AIGC] ⚠️ 查询状态异常 (第{attempt + 1}次): {e}")
-                continue
+            resp = requests.get(
+                status_url,
+                params={"taskId": tencent_task_id},
+                headers={"X-App-Id": app_id.strip(), "X-Api-Key": api_key.strip()},
+                timeout=30,
+                allow_redirects=False,
+            )
+            resp.raise_for_status()
+            status_result = resp.json()
 
             if status_result.get("code") != 200:
-                print(f"[Tonggan AIGC] ⚠️ 查询状态失败 (第{attempt + 1}次): {status_result.get('message')}")
                 continue
 
             data = status_result.get("data", {})
             status = data.get("status")
-            status_cn = self.STATUS_MAP.get(status, status)
-
-            if status != last_status:
-                print(f"[Tonggan AIGC] 📊 状态变更: {status} ({status_cn})")
-                last_status = status
 
             if status == "FINISH":
                 image_urls = data.get("imageUrls", [])
-                print(f"[Tonggan AIGC] ✅ 任务完成！共 {len(image_urls)} 张图片")
-                for i, url in enumerate(image_urls, 1):
-                    print(f"    图片 {i}: {url}")
                 break
 
             elif status == "FAIL":
                 err_msg = data.get("message", "未知错误")
                 err_code = data.get("errCode", "N/A")
-                print(f"[Tonggan AIGC] ❌ 任务失败: {err_msg} (errCode={err_code})")
                 raise RuntimeError(
                     f"[Tonggan AIGC] 任务失败: {err_msg} (errCode={err_code})"
                 )
 
             elif status in ("WAITING", "PROCESSING"):
-                if (attempt + 1) % 5 == 0 or attempt == 0:
-                    print(f"[Tonggan AIGC] ⏳ 轮询中... 第 {attempt + 1}/{max_attempts} 次 | 状态: {status_cn} | 已等待 {(attempt + 1) * poll_interval} 秒")
                 continue
-
-            else:
-                print(f"[Tonggan AIGC] ⚠️ 未知状态: {status}")
 
         else:
             raise RuntimeError(
@@ -246,20 +188,103 @@ class TongganAIGCNode:
             )
 
         if not image_urls:
-            print("[Tonggan AIGC] ⚠️ 任务完成但未返回图片 URL")
-            return ("[]",)
+            return ("",)
 
-        # ---------- 5. 输出 URL 列表 ----------
-        urls_json = json.dumps(image_urls, ensure_ascii=False)
-        print(f"\n[Tonggan AIGC] 📤 最终输出: {urls_json}\n")
-        return (urls_json,)
+        # 输出 URL 列表（纯文本，换行分隔）
+        return ("\n".join(image_urls),)
+
+
+# ==================== 节点二：图片上传 ====================
+class TongganImageUploadNode:
+    """
+    将 ComfyUI 图片上传至通感平台，获取可访问的 URL。
+    流程：获取七牛云 Token → 上传图片 → 返回 URL
+    """
+
+    CATEGORY = "image/upload"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("image_url",)
+    FUNCTION = "upload"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "app_id": ("STRING", {
+                    "default": "",
+                    "placeholder": "App ID，如 app_abcdefgh",
+                }),
+                "api_key": ("STRING", {
+                    "default": "",
+                    "placeholder": "API Key，如 sk-...",
+                }),
+                "token_url": ("STRING", {
+                    "default": "http://admin-dev.tongganagent.cn/api/v2/assets/get-uploadQN-token-passthrough",
+                    "placeholder": "获取上传Token的接口地址",
+                }),
+            }
+        }
+
+    def upload(self, image, app_id, api_key, token_url):
+        # image 是 torch tensor (B, H, W, C)，取第一张
+        img_tensor = image[0]  # (H, W, C)
+        img_np = (img_tensor.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        pil_image = Image.fromarray(img_np)
+
+        # 转为 PNG bytes
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        buf.seek(0)
+        file_bytes = buf.getvalue()
+
+        # 1. 获取七牛云上传 Token
+        headers = {
+            "X-App-Id": app_id.strip(),
+            "X-Api-Key": api_key.strip(),
+            "Content-Type": "application/json",
+        }
+        resp = requests.post(token_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+
+        if result.get("code") != 200:
+            raise RuntimeError(
+                f"[Tonggan Upload] 获取Token失败: {result.get('message', '未知错误')}"
+            )
+
+        data = result["data"]
+        uptoken = data["uptoken"]
+        upload_url = data["uploadUrl"]
+        key = data["key"]
+
+        # 2. 上传图片到七牛云（multipart/form-data）
+        files = {"file": ("image.png", file_bytes, "image/png")}
+        form_data = {
+            "token": uptoken,
+            "key": key,
+        }
+        resp = requests.post(upload_url, files=files, data=form_data, timeout=60)
+        resp.raise_for_status()
+        upload_result = resp.json()
+
+        # 3. 获取最终 URL
+        # 优先使用七牛云返回的 url 字段，否则按规则拼接
+        url = upload_result.get("url")
+        if not url:
+            url = f"https://img.tongganai.com/{key}"
+
+        return (url,)
 
 
 # ==================== 节点注册 ====================
 NODE_CLASS_MAPPINGS = {
     "TongganAIGCNode": TongganAIGCNode,
+    "TongganImageUploadNode": TongganImageUploadNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TongganAIGCNode": "🎨 Tonggan AIGC Image",
+    "TongganImageUploadNode": "📤 Tonggan Image Upload",
 }
