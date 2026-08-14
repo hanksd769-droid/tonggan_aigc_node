@@ -266,7 +266,15 @@ class TongganImageUploadNode:
             "key": key,
         }
         resp = requests.post(upload_url, files=files, data=form_data, timeout=60)
-        resp.raise_for_status()
+
+        # 修复：先检查状态码，非200时直接抛响应内容
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"[Tonggan Upload] 七牛云上传失败\n"
+                f"HTTP {resp.status_code}: {resp.reason}\n"
+                f"响应内容: {resp.text[:800]}"
+            )
+
         upload_result = resp.json()
 
         # 3. 获取最终 URL
