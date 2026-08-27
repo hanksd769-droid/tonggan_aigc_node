@@ -3,7 +3,7 @@ ComfyUI 自定义节点：通感 AIGC 生图 API + 图片上传
 
 功能：
 1. TongganAIGCNode: 提交生图任务 → 自动轮询状态 → 输出图片 URL 列表（纯文本）
-2. TongganImageUploadNode: 本地图片 → 上传七牛云 → 输出图片 URL（支持失败自动重试）
+2. TongganImageUploadNode: 本地图片 → 上传七牛云 → 输出图片 URL
 
 安装：将本文件保存到 ComfyUI/custom_nodes/tonggan_aigc_node.py，重启 ComfyUI
 """
@@ -194,13 +194,11 @@ class TongganAIGCNode:
         return ("\n".join(image_urls),)
 
 
-# ==================== 节点二：图片上传（带重试） ====================
+# ==================== 节点二：图片上传 ====================
 class TongganImageUploadNode:
     """
     将 ComfyUI 图片上传至通感平台，获取可访问的 URL。
     流程：获取七牛云 Token → 上传图片 → 返回 URL
-    支持失败自动重试：网络异常、Token 获取失败、七牛云上传失败均会重试，
-    每次重试重新获取 Token，避免 Token 过期导致反复失败。
     """
 
     CATEGORY = "image/upload"
@@ -226,26 +224,10 @@ class TongganImageUploadNode:
                     "default": "http://admin-dev.tongganagent.cn/api/v2/assets/get-uploadQN-token-passthrough",
                     "placeholder": "获取上传Token的接口地址",
                 }),
-                "retry_times": ("INT", {
-                    "default": 3,
-                    "min": 0,
-                    "max": 10,
-                    "step": 1,
-                    "display": "number",
-                    "tooltip": "上传失败后的重试次数（0 = 不重试）",
-                }),
-                "retry_interval": ("INT", {
-                    "default": 3,
-                    "min": 1,
-                    "max": 60,
-                    "step": 1,
-                    "display": "number",
-                    "tooltip": "重试等待秒数，逐次递增（第n次重试等待 n×该值 秒）",
-                }),
             }
         }
 
-    def upload(self, image, app_id, api_key, token_url, retry_times, retry_interval):
+    def upload(self, image, app_id, api_key, token_url):
         # image 是 torch tensor (B, H, W, C)，取第一张
         img_tensor = image[0]  # (H, W, C)
         img_np = (img_tensor.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
@@ -256,33 +238,6 @@ class TongganImageUploadNode:
         pil_image.save(buf, format="PNG")
         buf.seek(0)
         file_bytes = buf.getvalue()
-
-        # 带重试的上传：首次尝试 + retry_times 次重试
-        last_error = None
-        for attempt in range(1, retry_times + 2):
-            try:
-                url = self._upload_once(file_bytes, app_id, api_key, token_url)
-                if attempt > 1:
-                    print(f"[Tonggan Upload] 第 {attempt - 1} 次重试成功")
-                return (url,)
-            except Exception as e:
-                last_error = e
-                if attempt <= retry_times:
-                    wait = retry_interval * attempt
-                    print(
-                        f"[Tonggan Upload] 第 {attempt} 次上传失败: {e}，"
-                        f"{wait} 秒后进行第 {attempt} 次重试..."
-                    )
-                    time.sleep(wait)
-                else:
-                    print(f"[Tonggan Upload] 第 {attempt} 次上传失败: {e}，已达最大重试次数")
-
-        raise RuntimeError(
-            f"[Tonggan Upload] 上传失败（已重试 {retry_times} 次）: {last_error}"
-        )
-
-    def _upload_once(self, file_bytes, app_id, api_key, token_url):
-        """单次完整上传流程：获取 Token → 上传七牛云 → 返回 URL。失败抛异常由上层重试。"""
 
         # 1. 获取七牛云上传 Token
         headers = {
@@ -295,7 +250,9 @@ class TongganImageUploadNode:
         result = resp.json()
 
         if result.get("code") != 200:
-            raise RuntimeError(f"获取Token失败: {result.get('message', '未知错误')}")
+            raise RuntimeError(
+                f"[Tonggan Upload] 获取Token失败: {result.get('message', '未知错误')}"
+            )
 
         data = result["data"]
         uptoken = data["uptoken"]
@@ -309,14 +266,7 @@ class TongganImageUploadNode:
             "key": key,
         }
         resp = requests.post(upload_url, files=files, data=form_data, timeout=60)
-
-        # 先检查状态码，非200时直接抛响应内容
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"七牛云上传失败 HTTP {resp.status_code}: {resp.reason}，"
-                f"响应内容: {resp.text[:800]}"
-            )
-
+        resp.raise_for_status()
         upload_result = resp.json()
 
         # 3. 获取最终 URL
@@ -325,7 +275,7 @@ class TongganImageUploadNode:
         if not url:
             url = f"https://img.tongganai.com/{key}"
 
-        return url
+        return (url,)
 
 
 # ==================== 节点注册 ====================
