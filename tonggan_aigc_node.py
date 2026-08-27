@@ -415,7 +415,7 @@ class TongganAIGCNode:
         url13=None,
         url14=None,
     ):
-        task_id = int(time.time() * 1000) % 1000000
+        task_id = int(time.time() * 1000)
 
         # 收集文本 URL 和 14 个 URL 输入点
         url_values = (
