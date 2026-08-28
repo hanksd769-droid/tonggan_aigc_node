@@ -146,7 +146,7 @@ def _image_tensor_to_png_bytes(image_tensor):
     return buf.getvalue()
 
 
-def _upload_image_bytes(file_bytes, app_id, api_key, token_url):
+def _upload_image_bytes(file_bytes, app_id, api_key, token_url, timeout):
     """获取七牛云 Token → 上传图片 → 返回可访问 URL。"""
     headers = {
         "X-App-Id": app_id.strip(),
@@ -156,7 +156,7 @@ def _upload_image_bytes(file_bytes, app_id, api_key, token_url):
 
     # 1. 获取上传 Token
     try:
-        resp = requests.post(token_url.strip(), headers=headers, timeout=30)
+        resp = requests.post(token_url.strip(), headers=headers, timeout=timeout)
     except requests.RequestException as exc:
         _raise_api_error("Tonggan Upload", "获取上传 Token 网络异常", exc=exc)
 
@@ -220,7 +220,7 @@ def _upload_image_bytes(file_bytes, app_id, api_key, token_url):
             upload_url,
             files=files,
             data=form_data,
-            timeout=60,
+            timeout=timeout,
         )
     except requests.RequestException as exc:
         _raise_api_error(
@@ -256,12 +256,12 @@ def _upload_image_bytes(file_bytes, app_id, api_key, token_url):
     return url
 
 
-def _download_image_tensor(image_url):
+def _download_image_tensor(image_url, timeout):
     """下载单张图片 URL，并转换为 ComfyUI IMAGE tensor。"""
     try:
         resp = requests.get(
             image_url,
-            timeout=60,
+            timeout=timeout,
             headers={"User-Agent": "ComfyUI-TongganAIGC/1.0"},
         )
     except requests.RequestException as exc:
@@ -283,8 +283,8 @@ def _download_image_tensor(image_url):
     return torch.from_numpy(image_np)[None,]
 
 
-def _download_image_batch(image_urls):
-    tensors = [_download_image_tensor(url) for url in image_urls]
+def _download_image_batch(image_urls, timeout):
+    tensors = [_download_image_tensor(url, timeout) for url in image_urls]
     if len(tensors) == 1:
         return tensors[0]
 
@@ -359,12 +359,28 @@ class TongganAIGCNode:
                     "placeholder": "API Key，如 sk-...",
                 }),
                 "base_url": ("STRING", {
-                    "default": "https://www.tongganagent.cn/api/v2/ai-creations",
-                    "placeholder": "只填到 /ai-creations，不要带后缀",
+                    "default": "",
+                    "placeholder": "生图 API 地址，如 https://www.tongganai.cn/api/v2/ai-creations",
                 }),
                 "token_url": ("STRING", {
-                    "default": "http://admin-dev.tongganagent.cn/api/v2/assets/get-uploadQN-token-passthrough",
+                    "default": "",
                     "placeholder": "image 直连参考图时使用的上传 Token 接口",
+                }),
+                "model_name": ("STRING", {
+                    "default": "",
+                    "placeholder": "模型名称，如 GG",
+                }),
+                "model_version": ("STRING", {
+                    "default": "",
+                    "placeholder": "模型版本，如 3.1",
+                }),
+                "timeout": ("INT", {
+                    "default": 30,
+                    "min": 1,
+                    "max": 300,
+                    "step": 1,
+                    "display": "number",
+                    "tooltip": "所有网络请求的统一超时时间（秒）",
                 }),
                 "poll_interval": ("INT", {
                     "default": 5,
@@ -397,6 +413,9 @@ class TongganAIGCNode:
         api_key,
         base_url,
         token_url,
+        model_name,
+        model_version,
+        timeout,
         poll_interval,
         max_attempts,
         image=None,
@@ -416,6 +435,13 @@ class TongganAIGCNode:
         url14=None,
     ):
         task_id = int(time.time() * 1000)
+
+        if not base_url or not base_url.strip():
+            raise RuntimeError("[Tonggan AIGC] base_url 不能为空")
+        if not model_name or not model_name.strip():
+            raise RuntimeError("[Tonggan AIGC] model_name 不能为空")
+        if not model_version or not model_version.strip():
+            raise RuntimeError("[Tonggan AIGC] model_version 不能为空")
 
         # 收集文本 URL 和 14 个 URL 输入点
         url_values = (
@@ -445,6 +471,7 @@ class TongganAIGCNode:
                     app_id,
                     api_key,
                     token_url,
+                    timeout,
                 )
                 reference_urls.insert(0, uploaded_url)
             except Exception as exc:
@@ -462,8 +489,8 @@ class TongganAIGCNode:
             "taskId": task_id,
             "prompt": prompt,
             "resolution": resolution,
-            "modelName": "GG",
-            "modelVersion": "3.1",
+            "modelName": model_name.strip(),
+            "modelVersion": model_version.strip(),
             "aspectRatio": "" if aspectRatio == "auto" else aspectRatio,
             "inputFiles": [{"url": url} for url in reference_urls],
         }
@@ -490,7 +517,7 @@ class TongganAIGCNode:
                 submit_url,
                 json=body,
                 headers=headers,
-                timeout=30,
+                timeout=timeout,
                 allow_redirects=False,
             )
         except requests.RequestException as exc:
@@ -562,7 +589,7 @@ class TongganAIGCNode:
                         "X-App-Id": app_id.strip(),
                         "X-Api-Key": api_key.strip(),
                     },
-                    timeout=30,
+                    timeout=timeout,
                     allow_redirects=False,
                 )
             except requests.RequestException as exc:
@@ -667,7 +694,7 @@ class TongganAIGCNode:
 
         # 3. 下载生成图片，转为 ComfyUI IMAGE
         try:
-            image_tensor = _download_image_batch(image_urls)
+            image_tensor = _download_image_batch(image_urls, timeout)
         except Exception as exc:
             _raise_api_error(
                 "Tonggan AIGC",
@@ -713,8 +740,16 @@ class TongganImageUploadNode:
                     "placeholder": "API Key，如 sk-...",
                 }),
                 "token_url": ("STRING", {
-                    "default": "http://admin-dev.tongganagent.cn/api/v2/assets/get-uploadQN-token-passthrough",
+                    "default": "",
                     "placeholder": "获取上传Token的接口地址",
+                }),
+                "timeout": ("INT", {
+                    "default": 30,
+                    "min": 1,
+                    "max": 300,
+                    "step": 1,
+                    "display": "number",
+                    "tooltip": "所有网络请求的统一超时时间（秒）",
                 }),
                 "retry_times": ("INT", {
                     "default": 3,
@@ -735,13 +770,13 @@ class TongganImageUploadNode:
             }
         }
 
-    def upload(self, image, app_id, api_key, token_url, retry_times, retry_interval):
+    def upload(self, image, app_id, api_key, token_url, timeout, retry_times, retry_interval):
         file_bytes = _image_tensor_to_png_bytes(image[0])
 
         last_error = None
         for attempt in range(1, retry_times + 2):
             try:
-                url = _upload_image_bytes(file_bytes, app_id, api_key, token_url)
+                url = _upload_image_bytes(file_bytes, app_id, api_key, token_url, timeout)
                 if attempt > 1:
                     print(f"[Tonggan Upload] 第 {attempt - 1} 次重试成功")
                 return (url,)
